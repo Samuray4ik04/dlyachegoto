@@ -1,7 +1,7 @@
 import telebot
 import requests
 import re
-from telebot.types import InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineQueryResultArticle, InputTextMessageContent
 from collections import defaultdict
 
 # Настройки
@@ -15,7 +15,7 @@ bot = telebot.TeleBot(API_TOKEN)
 # Хранение истории чатов (chat_id: list of tuples (role, text))
 chat_histories = defaultdict(list)
 
-WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀"
+WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀\nИспользуй /clear для очистки истории чата"
 
 def generate_gemini_response(contents: list) -> str:
     """Синхронный запрос к Gemini API с историей сообщений"""
@@ -43,12 +43,6 @@ def format_response(text: str) -> str:
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     return text
 
-def get_clear_history_keyboard():
-    """Создает клавиатуру с кнопкой очистки истории"""
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("Очистить историю", callback_data="clear_history"))
-    return keyboard
-
 # Обработчик обычных сообщений
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
@@ -56,25 +50,17 @@ def handle_message(message):
     user_message = message.text
     
     # Добавляем сообщение пользователя в историю
-    chat_histories[chat_id].append(("user", user_message))
+    chat_histories[chat_id].append({"role": "user", "parts": [{"text": user_message}]})
     
     # Ограничиваем историю до 10 сообщений (5 обменов)
     if len(chat_histories[chat_id]) > 10:
         chat_histories[chat_id] = chat_histories[chat_id][-10:]
     
-    # Формируем содержимое для запроса к Gemini
-    contents = []
-    for role, text in chat_histories[chat_id]:
-        contents.append({
-            "role": role,
-            "parts": [{"text": text}]
-        })
-    
     bot.send_chat_action(chat_id, 'typing')
-    response = generate_gemini_response(contents)
+    response = generate_gemini_response(chat_histories[chat_id])
     
     # Добавляем ответ бота в историю
-    chat_histories[chat_id].append(("bot", response))
+    chat_histories[chat_id].append({"role": "model", "parts": [{"text": response}]})
     
     formatted_response = format_response(response)
     if len(formatted_response) > 4096:
@@ -84,8 +70,7 @@ def handle_message(message):
         chat_id,
         formatted_response,
         parse_mode='HTML',
-        reply_to_message_id=message.message_id,
-        reply_markup=get_clear_history_keyboard()
+        reply_to_message_id=message.message_id
     )
 
 # Обработчик inline-запросов
@@ -117,14 +102,13 @@ def handle_inline(inline_query):
         )
         bot.answer_inline_query(inline_query.id, [error_result])
 
-# Обработчик callback-запросов (очистка истории)
-@bot.callback_query_handler(func=lambda call: call.data == "clear_history")
-def handle_clear_history(call):
-    chat_id = call.message.chat.id
+# Обработчик команды /clear
+@bot.message_handler(commands=['clear'])
+def clear_history(message):
+    chat_id = message.chat.id
     if chat_id in chat_histories:
         del chat_histories[chat_id]
-    bot.answer_callback_query(call.id, "История очищена")
-    bot.send_message(chat_id, "✅ История чата успешно очищена!")
+    bot.reply_to(message, "✅ История чата успешно очищена!")
 
 # Команда /start
 @bot.message_handler(commands=['start'])
@@ -132,8 +116,7 @@ def send_welcome(message):
     bot.send_message(
         message.chat.id,
         WELCOME_MESSAGE,
-        parse_mode='MARKDOWN',
-        reply_markup=get_clear_history_keyboard()
+        parse_mode='MARKDOWN'
     )
 
 if __name__ == '__main__':
