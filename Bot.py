@@ -1,7 +1,7 @@
 import telebot
 import requests
 import re
-from telebot.types import InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from telebot.types import InlineQueryResultArticle, InputTextMessageContent, ReplyKeyboardMarkup, KeyboardButton
 from collections import defaultdict
 
 # Настройки
@@ -16,7 +16,7 @@ MODELS = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.0"]  # Доступн�
 # Инициализация бота
 bot = telebot.TeleBot(API_TOKEN)
 
-WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀"
+WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀\nИспользуй кнопки для управления"
 
 def get_gemini_url(model: str) -> str:
     """Формирует URL для запроса к Gemini API"""
@@ -49,20 +49,21 @@ def format_response(text: str) -> str:
     return text
 
 def get_main_keyboard():
-    """Создает основную клавиатуру с кнопками"""
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🧹 Очистить историю", callback_data="clear_history"),
-        InlineKeyboardButton("🔄 Сменить модель", callback_data="switch_model")
+    """Основная клавиатура с кнопками"""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("🧹 Очистить историю"),
+        KeyboardButton("🔄 Сменить модель")
     )
-    return keyboard
+    return markup
 
 def get_model_keyboard():
-    """Создает клавиатуру выбора модели"""
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    buttons = [InlineKeyboardButton(model, callback_data=f"model_{model}") for model in MODELS]
-    keyboard.add(*buttons)
-    return keyboard
+    """Клавиатура выбора модели"""
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    buttons = [KeyboardButton(model) for model in MODELS]
+    markup.add(*buttons)
+    markup.add(KeyboardButton("◀️ Назад"))
+    return markup
 
 # Обработчик обычных сообщений
 @bot.message_handler(func=lambda msg: True)
@@ -70,6 +71,17 @@ def handle_message(message):
     chat_id = message.chat.id
     user_message = message.text
     current_model = chat_models[chat_id]
+    
+    # Обработка команд через текстовые кнопки
+    if user_message == "청소ить историю":
+        return clear_history(message)
+    elif user_message == "🔄 Сменить модель":
+        return switch_model(message)
+    elif user_message in MODELS:
+        return select_model(message)
+    elif user_message == "◀️ Назад":
+        bot.send_message(chat_id, "Главное меню", reply_markup=get_main_keyboard())
+        return
     
     # Обновляем историю
     chat_histories[chat_id].append({"role": "user", "parts": [{"text": user_message}]})
@@ -99,7 +111,7 @@ def handle_inline(inline_query):
     try:
         response = generate_gemini_response(
             [{"role": "user", "parts": [{"text": inline_query.query}]}],
-            "gemini-2.0-flash"  # По умолчанию для инлайн-запросов
+            "gemini-2.0-flash"
         )
         
         formatted_response = format_response(response)
@@ -121,39 +133,43 @@ def handle_inline(inline_query):
             )]
         )
 
-# Обработчик callback-кнопок
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
-    chat_id = call.message.chat.id
+# Очистка истории
+def clear_history(message):
+    chat_id = message.chat.id
+    chat_histories[chat_id].clear()
+    bot.send_message(
+        chat_id,
+        "✅ История чата очищена",
+        reply_markup=get_main_keyboard()
+    )
+
+# Смена модели - шаг 1
+def switch_model(message):
+    chat_id = message.chat.id
+    bot.send_message(
+        chat_id,
+        "Выберите версию модели:",
+        reply_markup=get_model_keyboard()
+    )
+
+# Смена модели - шаг 2
+def select_model(message):
+    chat_id = message.chat.id
+    new_model = message.text
     
-    # Очистка истории
-    if call.data == "clear_history":
-        chat_histories[chat_id].clear()
-        bot.answer_callback_query(call.id, "История очищена")
-        bot.send_message(chat_id, "✅ История чата очищена", reply_markup=get_main_keyboard())
-    
-    # Смена модели
-    elif call.data == "switch_model":
-        bot.answer_callback_query(call.id)
+    if new_model in MODELS:
+        chat_models[chat_id] = new_model
         bot.send_message(
             chat_id,
-            "Выберите версию модели:",
+            f"✅ Модель изменена на {new_model}",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            "❌ Неверная модель",
             reply_markup=get_model_keyboard()
         )
-    
-    # Выбор конкретной модели
-    elif call.data.startswith("model_"):
-        new_model = call.data.split("_")[1]
-        if new_model in MODELS:
-            chat_models[chat_id] = new_model
-            bot.answer_callback_query(call.id, f"Модель изменена на {new_model}")
-            bot.send_message(
-                chat_id,
-                f"✅ Текущая модель: {new_model}",
-                reply_markup=get_main_keyboard()
-            )
-        else:
-            bot.answer_callback_query(call.id, "Ошибка выбора модели")
 
 # Команда /start
 @bot.message_handler(commands=['start'])
