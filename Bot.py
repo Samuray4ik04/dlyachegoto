@@ -1,95 +1,104 @@
-import requests
-import json
 import telebot
+import requests
+import re
+from telebot.types import InlineQueryResultArticle, InputTextMessageContent
 
 # Настройки
-TOGETHER_API_KEY = "tgp_v1_SdMNWA-0rbbWt68KTdXRNFnBwbzd6UFnx7BanF5gQ4s"
-API_URL = "https://api.together.xyz/v1/chat/completions"
-TELEGRAM_BOT_TOKEN = "7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk"  # Замените на ваш токен
+API_TOKEN = '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk'
+GEMINI_API_KEY = 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg'
+GEMINI_API_URL = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
 
 # Инициализация бота
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+bot = telebot.TeleBot(API_TOKEN)
 
-# Хранилище истории сообщений для каждого пользователя
-user_histories = {}
+WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀"
 
-def get_response_stream(messages):
-    headers = {
-        "Authorization": f"Bearer {TOGETHER_API_KEY}",
-        "Content-Type": "application/json"
-    }
+def generate_gemini_response(prompt: str) -> str:
+    """Синхронный запрос к Gemini API"""
+    try:
+        response = requests.post(
+            GEMINI_API_URL,
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            return "⚠️ Ошибка при обращении к API Gemini"
+            
+        data = response.json()
+        return data['candidates'][0]['content']['parts'][0]['text']
+        
+    except Exception as e:
+        return f"❌ Ошибка обработки ответа: {str(e)}"
+
+def format_response(text: str) -> str:
+    """Преобразует Markdown в HTML для Telegram"""
+    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
+    text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    return text
+
+# Обработчик обычных сообщений
+@bot.message_handler(func=lambda msg: True)
+def handle_message(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    response = generate_gemini_response(message.text)
+    formatted_response = format_response(response)
     
-    data = {
-        "model": "Qwen/Qwen2.5-72B-Instruct-Turbo",
-        "messages": messages,
-        "stream": True
-    }
-    
-    response = requests.post(API_URL, headers=headers, data=json.dumps(data), stream=True)
-    
-    if response.status_code != 200:
-        print(f"API Error: {response.status_code}")
-        yield "Ошибка подключения к API. Попробуйте позже."
-        return
+    if len(formatted_response) > 4096:
+        formatted_response = formatted_response[:4090] + "..."
+        
+    bot.send_message(
+        message.chat.id,
+        formatted_response,
+        parse_mode='HTML',
+        reply_to_message_id=message.message_id
+    )
 
-    for line in response.iter_lines():
-        if line:
-            decoded_line = line.decode('utf-8')
-            if decoded_line.startswith('data: '):
-                json_data = decoded_line[6:]
-                if json_data.strip() == '[DONE]':
-                    break
-                try:
-                    chunk = json.loads(json_data)
-                    delta = chunk['choices'][0].get('delta', {})
-                    content = delta.get('content', '')
-                    yield content
-                except json.JSONDecodeError:
-                    continue
+# Обработчик inline-запросов
+@bot.inline_handler(lambda query: True)
+def handle_inline(inline_query):
+    try:
+        # Генерация ответа
+        response = generate_gemini_response(inline_query.query)
+        formatted_response = format_response(response)
+        
+        # Создание результата
+        result = InlineQueryResultArticle(
+            id='1',
+            title="Ответ от Gemini",
+            description=response[:100] + "..." if len(response) > 100 else response,
+            input_message_content=InputTextMessageContent(
+                formatted_response,
+                parse_mode='HTML'
+            )
+        )
+        
+        # Отправка ответа
+        bot.answer_inline_query(
+            inline_query.id,
+            [result],
+            cache_time=10
+        )
+        
+    except Exception as e:
+        error_result = InlineQueryResultArticle(
+            id='error',
+            title="Ошибка",
+            description="Не удалось получить ответ",
+            input_message_content=InputTextMessageContent("⚠️ Ошибка обработки запроса")
+        )
+        bot.answer_inline_query(inline_query.id, [error_result])
 
+# Команда /start
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "Добро пожаловать! Я ваш AI-ассистент. Напишите что-нибудь, чтобы начать.")
+    bot.send_message(
+        message.chat.id,
+        WELCOME_MESSAGE,
+        parse_mode='MARKDOWN'
+    )
 
-@bot.message_handler(commands=['reset'])
-def reset_history(message):
-    user_id = message.chat.id
-    if user_id in user_histories:
-        del user_histories[user_id]
-    bot.reply_to(message, "История диалога очищена.")
-
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    user_id = message.chat.id
-    user_input = message.text
-    
-    # Инициализация истории для нового пользователя
-    if user_id not in user_histories:
-        user_histories[user_id] = []
-    
-    # Добавляем сообщение пользователя в историю
-    user_histories[user_id].append({"role": "user", "content": user_input})
-    
-    # Формируем ответ
-    try:
-        full_response = []
-        for chunk in get_response_stream(user_histories[user_id]):
-            full_response.append(chunk)
-        
-        # Объединяем все части ответа
-        assistant_response = ''.join(full_response).strip()
-        
-        # Добавляем ответ ассистента в историю
-        user_histories[user_id].append({"role": "assistant", "content": assistant_response})
-        
-        # Отправляем ответ пользователю
-        bot.reply_to(message, assistant_response)
-    
-    except Exception as e:
-        error_msg = f"Произошла ошибка: {str(e)}"
-        bot.reply_to(message, error_msg)
-        print(error_msg)
-
-if __name__ == "__main__":
-    print("Запуск бота...")
+if __name__ == '__main__':
     bot.polling(none_stop=True)
