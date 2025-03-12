@@ -3,6 +3,7 @@ import requests
 import re
 import os
 import logging
+import json
 from telebot.types import InlineQueryResultArticle, InputTextMessageContent, ReplyKeyboardMarkup, KeyboardButton
 from collections import defaultdict
 from functools import wraps
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 # Get sensitive data from environment variables (more secure than hardcoding)
 API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg')
+SAMBANOVA_API_KEY = os.getenv('d9e5445b-869d-4c25-adc4-b9c0b380e176', 'd9e5445b-869d-4c25-adc4-b9c0b380e176')  # ТУТ ВСТАВЛЯЕТЕ СВОЙ API КЛЮЧИК
+
+# API Endpoints
+SAMBANOVA_API_URL = "https://api.sambanova.ai/v1/chat/completions"
 
 # Constants
 MAX_HISTORY_LENGTH = 10
@@ -25,35 +30,43 @@ MAX_MESSAGE_LENGTH = 4000
 
 # Available models
 MODELS = {
+    # Gemini models
     "gemini-2.0-flash": "Gemini 2.0 Flash (быстрый)",
     "gemini-1.5-pro": "Gemini 1.5 Pro (продвинутый)",
-    "gemini-1.0": "Gemini 1.0 (базовый)"
+    "gemini-1.0": "Gemini 1.0 (базовый)",
+    # SambaNova models
+    "DeepSeek-R1": "DeepSeek-R1 (SambaNova)"
 }
 
 # Messages
 WELCOME_MESSAGE = """
-🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀
+🤖 *Привет! Я AI-бот с интеграцией нескольких моделей* 🚀
 
 Я могу помочь ответить на вопросы, написать текст или код.
 Используйте кнопки ниже для управления ботом:
 - 🧹 Очистить историю - сбросить контекст беседы
-- 🔄 Сменить модель - выбрать другую модель Gemini
+- 🔄 Сменить модель - выбрать другую модель AI
+
+Доступны модели:
+- Gemini (Google)
+- DeepSeek-R1 (SambaNova)
 
 Также можно использовать меня в inline-режиме в любом чате: @your_bot_name запрос
 """
 
 ERROR_MESSAGE = "❌ Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже."
-API_ERROR_MESSAGE = "⚠️ Ошибка API Gemini: {error}"
+API_ERROR_MESSAGE = "⚠️ Ошибка API: {error}"
 HISTORY_CLEARED_MESSAGE = "✅ История чата очищена. Начинаем новый разговор."
 MODEL_CHANGED_MESSAGE = "✅ Модель изменена на {model_name}"
 MODEL_SELECTION_MESSAGE = "Выберите версию модели AI:"
 BACK_TO_MAIN_MESSAGE = "Вернулись в главное меню"
 
-class GeminiBot:
-    def __init__(self, token, gemini_key):
+class AIBot:
+    def __init__(self, token, gemini_key, sambanova_key):
         """Initialize the bot with API tokens and state storage"""
         self.bot = telebot.TeleBot(token)
         self.gemini_api_key = gemini_key
+        self.sambanova_api_key = sambanova_key
         self.chat_histories = defaultdict(list)
         self.chat_models = defaultdict(lambda: "gemini-2.0-flash")
         self.setup_handlers()
@@ -129,6 +142,75 @@ class GeminiBot:
         except Exception as e:
             logger.error(f"Error in generate_gemini_response: {str(e)}", exc_info=True)
             return f"❌ Ошибка при обработке запроса: {str(e)}"
+    
+    def convert_history_to_sambanova_format(self, history):
+        """Convert chat history to SambaNova API format"""
+        # Start with system message
+        messages = [{"role": "system", "content": "You are a helpful assistant"}]
+        
+        # Add conversation history
+        for item in history:
+            role = "user" if item["role"] == "user" else "assistant"
+            content = item["parts"][0]["text"]
+            messages.append({"role": role, "content": content})
+        
+        return messages
+    
+    def generate_sambanova_response(self, history):
+        """Send request to SambaNova API with DeepSeek-R1 model"""
+        try:
+            # Convert history to SambaNova format
+            messages = self.convert_history_to_sambanova_format(history)
+            
+            # Prepare request body
+            payload = {
+                "model": "DeepSeek-R1",
+                "messages": messages,
+                "temperature": 0.1,
+                "top_p": 0.1
+            }
+            
+            # Prepare headers
+            headers = {
+                "Authorization": f"Bearer {self.sambanova_api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Send request
+            response = requests.post(
+                SAMBANOVA_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract response
+            if 'choices' in data and len(data['choices']) > 0:
+                return data['choices'][0]['message']['content']
+            else:
+                logger.warning(f"Unexpected SambaNova API response: {data}")
+                return "⚠️ Получен некорректный ответ от API SambaNova"
+                
+        except requests.exceptions.HTTPError as e:
+            return API_ERROR_MESSAGE.format(error=f"{e.response.status_code}: {e.response.text}")
+        except requests.exceptions.Timeout:
+            return "⚠️ Превышено время ожидания ответа от API SambaNova"
+        except Exception as e:
+            logger.error(f"Error in generate_sambanova_response: {str(e)}", exc_info=True)
+            return f"❌ Ошибка при обработке запроса SambaNova: {str(e)}"
+    
+    def generate_ai_response(self, history, model):
+        """Generate response using appropriate API based on selected model"""
+        # Check which API to use based on model name
+        if model.startswith("gemini"):
+            return self.generate_gemini_response(history, model)
+        elif model == "DeepSeek-R1":
+            return self.generate_sambanova_response(history)
+        else:
+            return f"⚠️ Неподдерживаемая модель: {model}"
     
     def format_response(self, text):
         """Convert markdown to HTML for Telegram messages"""
@@ -243,8 +325,8 @@ class GeminiBot:
         # Show typing indicator
         self.bot.send_chat_action(chat_id, 'typing')
         
-        # Get response from Gemini
-        response = self.generate_gemini_response(self.chat_histories[chat_id], current_model)
+        # Get response from selected AI model
+        response = self.generate_ai_response(self.chat_histories[chat_id], current_model)
         
         # Add bot's response to history
         self.chat_histories[chat_id].append({"role": "model", "parts": [{"text": response}]})
@@ -282,11 +364,14 @@ class GeminiBot:
             return
             
         try:
-            # Use simplified context for inline queries
-            response = self.generate_gemini_response(
-                [{"role": "user", "parts": [{"text": inline_query.query}]}],
-                "gemini-2.0-flash"  # Always use the fastest model for inline queries
-            )
+            # For inline queries, always use the fastest model
+            default_model = "gemini-2.0-flash"
+            
+            # Create simple history for inline query
+            history = [{"role": "user", "parts": [{"text": inline_query.query}]}]
+            
+            # Get response
+            response = self.generate_ai_response(history, default_model)
             
             formatted_response = self.format_response(response)
             
@@ -296,7 +381,7 @@ class GeminiBot:
             
             result = InlineQueryResultArticle(
                 id='1',
-                title="Ответ от Gemini",
+                title="Ответ от AI",
                 description=short_description,
                 input_message_content=InputTextMessageContent(
                     formatted_response, 
@@ -331,9 +416,12 @@ if __name__ == '__main__':
         
         if not GEMINI_API_KEY or GEMINI_API_KEY == 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg':
             logger.warning("Using default Gemini API key. Consider setting up environment variables.")
+            
+        if not SAMBANOVA_API_KEY or SAMBANOVA_API_KEY == 'вот тута':
+            logger.warning("Using default SambaNova API key. Consider setting up environment variables.")
         
         # Create and run the bot
-        gemini_bot = GeminiBot(API_TOKEN, GEMINI_API_KEY)
-        gemini_bot.run()
+        ai_bot = AIBot(API_TOKEN, GEMINI_API_KEY, SAMBANOVA_API_KEY)
+        ai_bot.run()
     except Exception as e:
         logger.critical(f"Failed to start the bot: {str(e)}", exc_info=True)
