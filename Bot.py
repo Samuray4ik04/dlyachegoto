@@ -1,185 +1,339 @@
 import telebot
 import requests
 import re
+import os
+import logging
 from telebot.types import InlineQueryResultArticle, InputTextMessageContent, ReplyKeyboardMarkup, KeyboardButton
 from collections import defaultdict
+from functools import wraps
 
-# Настройки
-API_TOKEN = '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk'
-GEMINI_API_KEY = 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Хранение состояний
-chat_histories = defaultdict(list)  # История сообщений
-chat_models = defaultdict(lambda: "gemini-2.0-flash")  # Текущая модель для каждого чата
-MODELS = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.0"]  # Доступные модели
+# Get sensitive data from environment variables (more secure than hardcoding)
+API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg')
 
-# Инициализация бота
-bot = telebot.TeleBot(API_TOKEN)
+# Constants
+MAX_HISTORY_LENGTH = 10
+REQUEST_TIMEOUT = 15
+MAX_MESSAGE_LENGTH = 4000
 
-WELCOME_MESSAGE = "🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀\nИспользуй кнопки для управления"
+# Available models
+MODELS = {
+    "gemini-2.0-flash": "Gemini 2.0 Flash (быстрый)",
+    "gemini-1.5-pro": "Gemini 1.5 Pro (продвинутый)",
+    "gemini-1.0": "Gemini 1.0 (базовый)"
+}
 
-def get_gemini_url(model: str) -> str:
-    """Формирует URL для запроса к Gemini API"""
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+# Messages
+WELCOME_MESSAGE = """
+🤖 *Привет! Я AI-бот с интеграцией Gemini* 🚀
 
-def generate_gemini_response(contents: list, model: str) -> str:
-    """Синхронный запрос к Gemini API с указанием модели"""
-    try:
-        response = requests.post(
-            get_gemini_url(model),
-            json={"contents": contents},
-            headers={'Content-Type': 'application/json'},
-            timeout=10
-        )
+Я могу помочь ответить на вопросы, написать текст или код.
+Используйте кнопки ниже для управления ботом:
+- 🧹 Очистить историю - сбросить контекст беседы
+- 🔄 Сменить модель - выбрать другую модель Gemini
+
+Также можно использовать меня в inline-режиме в любом чате: @your_bot_name запрос
+"""
+
+ERROR_MESSAGE = "❌ Произошла ошибка при обработке запроса. Пожалуйста, попробуйте позже."
+API_ERROR_MESSAGE = "⚠️ Ошибка API Gemini: {error}"
+HISTORY_CLEARED_MESSAGE = "✅ История чата очищена. Начинаем новый разговор."
+MODEL_CHANGED_MESSAGE = "✅ Модель изменена на {model_name}"
+MODEL_SELECTION_MESSAGE = "Выберите версию модели AI:"
+BACK_TO_MAIN_MESSAGE = "Вернулись в главное меню"
+
+class GeminiBot:
+    def __init__(self, token, gemini_key):
+        """Initialize the bot with API tokens and state storage"""
+        self.bot = telebot.TeleBot(token)
+        self.gemini_api_key = gemini_key
+        self.chat_histories = defaultdict(list)
+        self.chat_models = defaultdict(lambda: "gemini-2.0-flash")
+        self.setup_handlers()
+    
+    def setup_handlers(self):
+        """Set up all message handlers"""
+        # Command handlers
+        self.bot.message_handler(commands=['start', 'help'])(self.send_welcome)
         
-        if response.status_code != 200:
-            return f"⚠️ Ошибка API ({response.status_code}): {response.text}"
+        # Button handlers
+        self.bot.message_handler(func=lambda msg: msg.text == "🧹 Очистить историю")(self.clear_history)
+        self.bot.message_handler(func=lambda msg: msg.text == "🔄 Сменить модель")(self.switch_model)
+        self.bot.message_handler(func=lambda msg: msg.text in MODELS)(self.select_model)
+        self.bot.message_handler(func=lambda msg: msg.text == "◀️ Назад")(self.back_to_main)
+        
+        # Inline query handler
+        self.bot.inline_handler(lambda query: True)(self.handle_inline)
+        
+        # Default message handler (catches all other messages)
+        self.bot.message_handler(func=lambda msg: True)(self.handle_message)
+    
+    def error_handler(func):
+        """Decorator for error handling in methods"""
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except Exception as e:
+                logger.error(f"Error in {func.__name__}: {str(e)}", exc_info=True)
+                # If we have a message object, send error message
+                if args and hasattr(args[0], 'chat'):
+                    self.bot.send_message(
+                        args[0].chat.id,
+                        ERROR_MESSAGE,
+                        reply_markup=self.get_main_keyboard()
+                    )
+        return wrapper
+    
+    def get_gemini_url(self, model):
+        """Forms URL for Gemini API request"""
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.gemini_api_key}"
+    
+    def generate_gemini_response(self, contents, model):
+        """Send synchronous request to Gemini API with specified model"""
+        try:
+            response = requests.post(
+                self.get_gemini_url(model),
+                json={"contents": contents, "generationConfig": {"temperature": 0.7}},
+                headers={'Content-Type': 'application/json'},
+                timeout=REQUEST_TIMEOUT
+            )
             
-        data = response.json()
-        return data['candidates'][0]['content']['parts'][0]['text']
-        
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-def format_response(text: str) -> str:
-    """Преобразует Markdown в HTML для Telegram"""
-    text = re.sub(r'```(.*?)```', r'<pre>\1</pre>', text, flags=re.DOTALL)
-    text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
-    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-    return text
-
-def get_main_keyboard():
-    """Основная клавиатура с кнопками"""
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        KeyboardButton("🧹 Очистить историю"),
-        KeyboardButton("🔄 Сменить модель")
-    )
-    return markup
-
-def get_model_keyboard():
-    """Клавиатура выбора модели"""
-    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    buttons = [KeyboardButton(model) for model in MODELS]
-    markup.add(*buttons)
-    markup.add(KeyboardButton("◀️ Назад"))
-    return markup
-
-# Обработчик обычных сообщений
-@bot.message_handler(func=lambda msg: True)
-def handle_message(message):
-    chat_id = message.chat.id
-    user_message = message.text
-    current_model = chat_models[chat_id]
+            response.raise_for_status()
+            data = response.json()
+            
+            # Check if response has the expected structure
+            if 'candidates' not in data or not data['candidates']:
+                logger.warning(f"Unexpected API response: {data}")
+                return "⚠️ Получен некорректный ответ от API"
+                
+            # Handle content filtering cases
+            if 'content' not in data['candidates'][0]:
+                if 'finishReason' in data['candidates'][0] and data['candidates'][0]['finishReason'] == 'SAFETY':
+                    return "⚠️ Запрос был отклонен системой безопасности Gemini"
+                return "⚠️ Не удалось получить ответ от модели"
+                
+            return data['candidates'][0]['content']['parts'][0]['text']
+            
+        except requests.exceptions.HTTPError as e:
+            return API_ERROR_MESSAGE.format(error=f"{e.response.status_code}: {e.response.text}")
+        except requests.exceptions.Timeout:
+            return "⚠️ Превышено время ожидания ответа от API"
+        except Exception as e:
+            logger.error(f"Error in generate_gemini_response: {str(e)}", exc_info=True)
+            return f"❌ Ошибка при обработке запроса: {str(e)}"
     
-    # Обработка команд через текстовые кнопки
-    if user_message == "청소ить историю":
-        return clear_history(message)
-    elif user_message == "🔄 Сменить модель":
-        return switch_model(message)
-    elif user_message in MODELS:
-        return select_model(message)
-    elif user_message == "◀️ Назад":
-        bot.send_message(chat_id, "Главное меню", reply_markup=get_main_keyboard())
-        return
+    def format_response(self, text):
+        """Convert markdown to HTML for Telegram messages"""
+        # Replace code blocks
+        text = re.sub(r'```(\w*)\n(.*?)```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
+        # Replace inline code
+        text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
+        # Replace bold text
+        text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+        # Replace italic text
+        text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+        return text
     
-    # Обновляем историю
-    chat_histories[chat_id].append({"role": "user", "parts": [{"text": user_message}]})
-    if len(chat_histories[chat_id]) > 10:
-        chat_histories[chat_id] = chat_histories[chat_id][-10:]
-    
-    bot.send_chat_action(chat_id, 'typing')
-    response = generate_gemini_response(chat_histories[chat_id], current_model)
-    
-    # Добавляем ответ бота в историю
-    chat_histories[chat_id].append({"role": "model", "parts": [{"text": response}]})
-    
-    formatted_response = format_response(response)
-    if len(formatted_response) > 4096:
-        formatted_response = formatted_response[:4090] + "..."
-    
-    bot.send_message(
-        chat_id,
-        formatted_response,
-        parse_mode='HTML',
-        reply_markup=get_main_keyboard()
-    )
-
-# Обработчик inline-запросов
-@bot.inline_handler(lambda query: True)
-def handle_inline(inline_query):
-    try:
-        response = generate_gemini_response(
-            [{"role": "user", "parts": [{"text": inline_query.query}]}],
-            "gemini-2.0-flash"
+    def get_main_keyboard(self):
+        """Main keyboard with control buttons"""
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        markup.add(
+            KeyboardButton("🧹 Очистить историю"),
+            KeyboardButton("🔄 Сменить модель")
         )
-        
-        formatted_response = format_response(response)
-        result = InlineQueryResultArticle(
-            id='1',
-            title="Ответ от Gemini",
-            description=response[:100] + "..." if len(response) > 100 else response,
-            input_message_content=InputTextMessageContent(formatted_response, parse_mode='HTML')
-        )
-        
-        bot.answer_inline_query(inline_query.id, [result], cache_time=10)
-    except Exception as e:
-        bot.answer_inline_query(
-            inline_query.id,
-            [InlineQueryResultArticle(
-                id='error',
-                title="Ошибка",
-                input_message_content=InputTextMessageContent(f"⚠️ {str(e)}")
-            )]
-        )
-
-# Очистка истории
-def clear_history(message):
-    chat_id = message.chat.id
-    chat_histories[chat_id].clear()
-    bot.send_message(
-        chat_id,
-        "✅ История чата очищена",
-        reply_markup=get_main_keyboard()
-    )
-
-# Смена модели - шаг 1
-def switch_model(message):
-    chat_id = message.chat.id
-    bot.send_message(
-        chat_id,
-        "Выберите версию модели:",
-        reply_markup=get_model_keyboard()
-    )
-
-# Смена модели - шаг 2
-def select_model(message):
-    chat_id = message.chat.id
-    new_model = message.text
+        return markup
     
-    if new_model in MODELS:
-        chat_models[chat_id] = new_model
-        bot.send_message(
+    def get_model_keyboard(self):
+        """Keyboard for model selection"""
+        markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+        buttons = [KeyboardButton(model) for model in MODELS]
+        markup.add(*buttons)
+        markup.add(KeyboardButton("◀️ Назад"))
+        return markup
+    
+    @error_handler
+    def send_welcome(self, message):
+        """Handle /start command"""
+        self.bot.send_message(
+            message.chat.id,
+            WELCOME_MESSAGE,
+            parse_mode='MARKDOWN',
+            reply_markup=self.get_main_keyboard()
+        )
+    
+    @error_handler
+    def clear_history(self, message):
+        """Clear chat history"""
+        chat_id = message.chat.id
+        self.chat_histories[chat_id].clear()
+        self.bot.send_message(
             chat_id,
-            f"✅ Модель изменена на {new_model}",
-            reply_markup=get_main_keyboard()
+            HISTORY_CLEARED_MESSAGE,
+            reply_markup=self.get_main_keyboard()
         )
-    else:
-        bot.send_message(
+    
+    @error_handler
+    def switch_model(self, message):
+        """Show model selection keyboard"""
+        chat_id = message.chat.id
+        model_options = "\n".join([f"• {key}: {desc}" for key, desc in MODELS.items()])
+        self.bot.send_message(
             chat_id,
-            "❌ Неверная модель",
-            reply_markup=get_model_keyboard()
+            f"{MODEL_SELECTION_MESSAGE}\n\n{model_options}",
+            reply_markup=self.get_model_keyboard()
         )
+    
+    @error_handler
+    def select_model(self, message):
+        """Handle model selection"""
+        chat_id = message.chat.id
+        new_model = message.text
+        
+        if new_model in MODELS:
+            self.chat_models[chat_id] = new_model
+            model_name = MODELS[new_model]
+            self.bot.send_message(
+                chat_id,
+                MODEL_CHANGED_MESSAGE.format(model_name=model_name),
+                reply_markup=self.get_main_keyboard()
+            )
+        else:
+            self.bot.send_message(
+                chat_id,
+                "❌ Неверная модель",
+                reply_markup=self.get_model_keyboard()
+            )
+    
+    @error_handler
+    def back_to_main(self, message):
+        """Return to main menu"""
+        self.bot.send_message(
+            message.chat.id,
+            BACK_TO_MAIN_MESSAGE,
+            reply_markup=self.get_main_keyboard()
+        )
+    
+    @error_handler
+    def handle_message(self, message):
+        """Process user messages and get AI responses"""
+        chat_id = message.chat.id
+        user_message = message.text
+        current_model = self.chat_models[chat_id]
+        
+        # Process message based on user's input
+        if user_message.startswith('/'):
+            # Ignore unrecognized commands
+            return
+        
+        # Update chat history
+        self.chat_histories[chat_id].append({"role": "user", "parts": [{"text": user_message}]})
+        
+        # Limit history length
+        if len(self.chat_histories[chat_id]) > MAX_HISTORY_LENGTH:
+            self.chat_histories[chat_id] = self.chat_histories[chat_id][-MAX_HISTORY_LENGTH:]
+        
+        # Show typing indicator
+        self.bot.send_chat_action(chat_id, 'typing')
+        
+        # Get response from Gemini
+        response = self.generate_gemini_response(self.chat_histories[chat_id], current_model)
+        
+        # Add bot's response to history
+        self.chat_histories[chat_id].append({"role": "model", "parts": [{"text": response}]})
+        
+        # Format response for Telegram
+        formatted_response = self.format_response(response)
+        
+        # Split message if it's too long
+        if len(formatted_response) > MAX_MESSAGE_LENGTH:
+            chunks = [formatted_response[i:i+MAX_MESSAGE_LENGTH] 
+                     for i in range(0, len(formatted_response), MAX_MESSAGE_LENGTH)]
+            
+            for i, chunk in enumerate(chunks):
+                # Only add keyboard to the last chunk
+                reply_markup = self.get_main_keyboard() if i == len(chunks) - 1 else None
+                
+                self.bot.send_message(
+                    chat_id,
+                    chunk if i < len(chunks) - 1 else chunk + "\n\n[Сообщение было разделено из-за ограничений Telegram]",
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+        else:
+            self.bot.send_message(
+                chat_id,
+                formatted_response,
+                parse_mode='HTML',
+                reply_markup=self.get_main_keyboard()
+            )
+    
+    @error_handler
+    def handle_inline(self, inline_query):
+        """Process inline queries"""
+        if not inline_query.query:
+            return
+            
+        try:
+            # Use simplified context for inline queries
+            response = self.generate_gemini_response(
+                [{"role": "user", "parts": [{"text": inline_query.query}]}],
+                "gemini-2.0-flash"  # Always use the fastest model for inline queries
+            )
+            
+            formatted_response = self.format_response(response)
+            
+            # Truncate response for description
+            short_description = response[:100] + "..." if len(response) > 100 else response
+            short_description = re.sub(r'\s+', ' ', short_description)  # Remove excess whitespace
+            
+            result = InlineQueryResultArticle(
+                id='1',
+                title="Ответ от Gemini",
+                description=short_description,
+                input_message_content=InputTextMessageContent(
+                    formatted_response, 
+                    parse_mode='HTML'
+                )
+            )
+            
+            self.bot.answer_inline_query(inline_query.id, [result], cache_time=60)
+        except Exception as e:
+            logger.error(f"Error in inline query: {str(e)}", exc_info=True)
+            self.bot.answer_inline_query(
+                inline_query.id,
+                [InlineQueryResultArticle(
+                    id='error',
+                    title="Ошибка",
+                    description="Не удалось обработать запрос",
+                    input_message_content=InputTextMessageContent(ERROR_MESSAGE)
+                )]
+            )
+    
+    def run(self):
+        """Start the bot"""
+        logger.info("Starting the bot...")
+        self.bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
-# Команда /start
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.send_message(
-        message.chat.id,
-        WELCOME_MESSAGE,
-        parse_mode='MARKDOWN',
-        reply_markup=get_main_keyboard()
-    )
 
 if __name__ == '__main__':
-    bot.polling(none_stop=True)
+    try:
+        # Validate API tokens
+        if not API_TOKEN or API_TOKEN == '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk':
+            logger.warning("Using default Telegram API token. Consider setting up environment variables.")
+        
+        if not GEMINI_API_KEY or GEMINI_API_KEY == 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg':
+            logger.warning("Using default Gemini API key. Consider setting up environment variables.")
+        
+        # Create and run the bot
+        gemini_bot = GeminiBot(API_TOKEN, GEMINI_API_KEY)
+        gemini_bot.run()
+    except Exception as e:
+        logger.critical(f"Failed to start the bot: {str(e)}", exc_info=True)
