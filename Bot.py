@@ -18,14 +18,16 @@ logger = logging.getLogger(__name__)
 # Get sensitive data from environment variables (more secure than hardcoding)
 API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '7147872197:AAFvz-_Q4sZ14npKR3_sgUQgYxYPUH81Hkk')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg')
-SAMBANOVA_API_KEY = os.getenv('d9e5445b-869d-4c25-adc4-b9c0b380e176', 'd9e5445b-869d-4c25-adc4-b9c0b380e176')  # ТУТ ВСТАВЛЯЕТЕ СВОЙ API КЛЮЧИК
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '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')  # API key from https://openrouter.ai/settings/keys
+TOGETHER_API_KEY = os.getenv('TOGETHER_API_KEY', 'fd3395959cc541410ef887a2fcca346686bf3306225ab4cc14c21880390beedc')  # API key inside brackets
 
 # API Endpoints
-SAMBANOVA_API_URL = "https://api.sambanova.ai/v1/chat/completions"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+TOGETHER_API_URL = "https://api.together.xyz/v1/chat/completions"
 
 # Constants
 MAX_HISTORY_LENGTH = 10
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 30  # Increased timeout for models that may take longer
 MAX_MESSAGE_LENGTH = 4000
 
 # Available models
@@ -34,8 +36,10 @@ MODELS = {
     "gemini-2.0-flash": "Gemini 2.0 Flash (быстрый)",
     "gemini-1.5-pro": "Gemini 1.5 Pro (продвинутый)",
     "gemini-1.0": "Gemini 1.0 (базовый)",
-    # SambaNova models
-    "DeepSeek-R1": "DeepSeek-R1 (SambaNova)"
+    # OpenRouter models
+    "deepseek-r1": "DeepSeek R1 (OpenRouter)",
+    # Together AI models
+    "Qwen2.5-72B": "Qwen 2.5 72B (Together AI)"
 }
 
 # Messages
@@ -49,7 +53,8 @@ WELCOME_MESSAGE = """
 
 Доступны модели:
 - Gemini (Google)
-- DeepSeek-R1 (SambaNova)
+- DeepSeek R1 (OpenRouter)
+- Qwen 2.5 72B (Together AI)
 
 Также можно использовать меня в inline-режиме в любом чате: @your_bot_name запрос
 """
@@ -62,11 +67,12 @@ MODEL_SELECTION_MESSAGE = "Выберите версию модели AI:"
 BACK_TO_MAIN_MESSAGE = "Вернулись в главное меню"
 
 class AIBot:
-    def __init__(self, token, gemini_key, sambanova_key):
+    def __init__(self, token, gemini_key, openrouter_key, together_key):
         """Initialize the bot with API tokens and state storage"""
         self.bot = telebot.TeleBot(token)
         self.gemini_api_key = gemini_key
-        self.sambanova_api_key = sambanova_key
+        self.openrouter_api_key = openrouter_key
+        self.together_api_key = together_key
         self.chat_histories = defaultdict(list)
         self.chat_models = defaultdict(lambda: "gemini-2.0-flash")
         self.setup_handlers()
@@ -143,42 +149,112 @@ class AIBot:
             logger.error(f"Error in generate_gemini_response: {str(e)}", exc_info=True)
             return f"❌ Ошибка при обработке запроса: {str(e)}"
     
-    def convert_history_to_sambanova_format(self, history):
-        """Convert chat history to SambaNova API format"""
-        # Start with system message
-        messages = [{"role": "system", "content": "You are a helpful assistant"}]
+    def process_content(self, content):
+        """Remove thinking tags from content"""
+        return content.replace('<think>', '').replace('</think>', '')
+    
+    def convert_history_to_openrouter_format(self, history):
+        """Convert chat history to OpenRouter API format"""
+        messages = []
         
-        # Add conversation history
         for item in history:
             role = "user" if item["role"] == "user" else "assistant"
             content = item["parts"][0]["text"]
             messages.append({"role": role, "content": content})
         
+        # Add a system message at the beginning if there isn't one
+        if not messages or messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": "You are a helpful assistant"})
+        
         return messages
     
-    def generate_sambanova_response(self, history):
-        """Send request to SambaNova API with DeepSeek-R1 model"""
+    def generate_openrouter_response(self, history):
+        """Send request to OpenRouter API with DeepSeek-R1 model"""
         try:
-            # Convert history to SambaNova format
-            messages = self.convert_history_to_sambanova_format(history)
+            # Convert history to OpenRouter format
+            messages = self.convert_history_to_openrouter_format(history)
             
             # Prepare request body
             payload = {
-                "model": "DeepSeek-R1",
+                "model": "deepseek/deepseek-r1",
                 "messages": messages,
-                "temperature": 0.1,
-                "top_p": 0.1
+                "temperature": 0.7,
+                "max_tokens": 1000
             }
             
             # Prepare headers
             headers = {
-                "Authorization": f"Bearer {self.sambanova_api_key}",
+                "Authorization": f"Bearer {self.openrouter_api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://telegram-bot.com",  # Required by OpenRouter
+                "X-Title": "Telegram AI Bot"  # Optional but good practice for OpenRouter
+            }
+            
+            # Send request
+            response = requests.post(
+                OPENROUTER_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            # Extract and process response
+            if 'choices' in data and len(data['choices']) > 0:
+                content = data['choices'][0]['message']['content']
+                return self.process_content(content)
+            else:
+                logger.warning(f"Unexpected OpenRouter API response: {data}")
+                return "⚠️ Получен некорректный ответ от API OpenRouter"
+                
+        except requests.exceptions.HTTPError as e:
+            return API_ERROR_MESSAGE.format(error=f"{e.response.status_code}: {e.response.text}")
+        except requests.exceptions.Timeout:
+            return "⚠️ Превышено время ожидания ответа от API OpenRouter"
+        except Exception as e:
+            logger.error(f"Error in generate_openrouter_response: {str(e)}", exc_info=True)
+            return f"❌ Ошибка при обработке запроса OpenRouter: {str(e)}"
+    
+    def convert_history_to_together_format(self, history):
+        """Convert chat history to Together AI API format"""
+        messages = []
+        
+        for item in history:
+            role = "user" if item["role"] == "user" else "assistant"
+            content = item["parts"][0]["text"]
+            messages.append({"role": role, "content": content})
+        
+        # Add a system message at the beginning if there isn't one
+        if not messages or messages[0]["role"] != "system":
+            messages.insert(0, {"role": "system", "content": "You are a helpful assistant"})
+        
+        return messages
+
+    def generate_together_response(self, history):
+        """Send request to Together AI API"""
+        try:
+            # Convert history to Together format
+            messages = self.convert_history_to_together_format(history)
+            
+            # Prepare request body
+            payload = {
+                "model": "Qwen/Qwen2.5-72B-Instruct-Turbo",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 1000
+            }
+            
+            # Prepare headers
+            headers = {
+                "Authorization": f"Bearer {self.together_api_key}",
                 "Content-Type": "application/json"
             }
             
             # Send request
             response = requests.post(
-                SAMBANOVA_API_URL,
+                TOGETHER_API_URL,
                 json=payload,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT
@@ -191,24 +267,26 @@ class AIBot:
             if 'choices' in data and len(data['choices']) > 0:
                 return data['choices'][0]['message']['content']
             else:
-                logger.warning(f"Unexpected SambaNova API response: {data}")
-                return "⚠️ Получен некорректный ответ от API SambaNova"
+                logger.warning(f"Unexpected Together AI API response: {data}")
+                return "⚠️ Получен некорректный ответ от API Together AI"
                 
         except requests.exceptions.HTTPError as e:
             return API_ERROR_MESSAGE.format(error=f"{e.response.status_code}: {e.response.text}")
         except requests.exceptions.Timeout:
-            return "⚠️ Превышено время ожидания ответа от API SambaNova"
+            return "⚠️ Превышено время ожидания ответа от API Together AI"
         except Exception as e:
-            logger.error(f"Error in generate_sambanova_response: {str(e)}", exc_info=True)
-            return f"❌ Ошибка при обработке запроса SambaNova: {str(e)}"
+            logger.error(f"Error in generate_together_response: {str(e)}", exc_info=True)
+            return f"❌ Ошибка при обработке запроса Together AI: {str(e)}"
     
     def generate_ai_response(self, history, model):
         """Generate response using appropriate API based on selected model"""
         # Check which API to use based on model name
         if model.startswith("gemini"):
             return self.generate_gemini_response(history, model)
-        elif model == "DeepSeek-R1":
-            return self.generate_sambanova_response(history)
+        elif model == "deepseek-r1":
+            return self.generate_openrouter_response(history)
+        elif model == "Qwen2.5-72B":
+            return self.generate_together_response(history)
         else:
             return f"⚠️ Неподдерживаемая модель: {model}"
     
@@ -417,11 +495,14 @@ if __name__ == '__main__':
         if not GEMINI_API_KEY or GEMINI_API_KEY == 'AIzaSyAj3Hn-iYmU3fi_vhMmar5iayJGPEK9sxg':
             logger.warning("Using default Gemini API key. Consider setting up environment variables.")
             
-        if not SAMBANOVA_API_KEY or SAMBANOVA_API_KEY == 'вот тута':
-            logger.warning("Using default SambaNova API key. Consider setting up environment variables.")
+        if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == '':
+            logger.warning("OpenRouter API key is not set. DeepSeek R1 model will not work.")
+            
+        if not TOGETHER_API_KEY or TOGETHER_API_KEY == '':
+            logger.warning("Together AI API key is not set. Together AI models will not work.")
         
         # Create and run the bot
-        ai_bot = AIBot(API_TOKEN, GEMINI_API_KEY, SAMBANOVA_API_KEY)
+        ai_bot = AIBot(API_TOKEN, GEMINI_API_KEY, OPENROUTER_API_KEY, TOGETHER_API_KEY)
         ai_bot.run()
     except Exception as e:
         logger.critical(f"Failed to start the bot: {str(e)}", exc_info=True)
